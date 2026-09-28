@@ -34,6 +34,21 @@ const MODEL_MAPPING = {
   'claude-3-sonnet': 'minimax-m2.7-free'
 };
 
+// Lê o corpo de erro que a Zen devolveu (pode vir como stream quando stream=true)
+async function readUpstreamError(error) {
+  const data = error.response?.data;
+  if (!data) return null;
+  if (typeof data.on === 'function') {
+    return await new Promise((resolve) => {
+      let body = '';
+      data.on('data', (c) => { body += c.toString(); });
+      data.on('end', () => resolve(body));
+      data.on('error', () => resolve(body));
+    });
+  }
+  return typeof data === 'string' ? data : JSON.stringify(data);
+}
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({
@@ -44,8 +59,8 @@ app.get('/health', (req, res) => {
   });
 });
 
-// List models endpoint (OpenAI compatible)
-app.get('/v1/models', (req, res) => {
+// List models endpoint (OpenAI compatible) - com e sem prefixo /v1
+app.get(['/v1/models', '/models'], (req, res) => {
   const models = Object.keys(MODEL_MAPPING).map(model => ({
     id: model,
     object: 'model',
@@ -60,12 +75,13 @@ app.get('/v1/models', (req, res) => {
 });
 
 // Chat completions endpoint (main proxy)
-app.post('/v1/chat/completions', async (req, res) => {
-  try {
-    const { model, messages, temperature, max_tokens, stream } = req.body;
+async function handleChatCompletions(req, res) {
+  const { model, messages, temperature, max_tokens, stream } = req.body;
+  let zenModel;
 
+  try {
     // Smart model selection with fallback
-    let zenModel = MODEL_MAPPING[model];
+    zenModel = MODEL_MAPPING[model];
     if (!zenModel) {
       // Se o model pedido já for um nome válido de modelo Zen, usa direto
       zenModel = model;
@@ -194,17 +210,35 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
 
   } catch (error) {
-    console.error('Proxy error:', error.message);
+    const upstreamBody = await readUpstreamError(error);
+    const status = error.response?.status || 500;
 
-    res.status(error.response?.status || 500).json({
+    // Log completo pro painel do Render (ajuda a achar a causa real)
+    console.error('Proxy error:', error.message);
+    console.error('  upstream status:', status);
+    console.error('  upstream body:', upstreamBody || '(vazio)');
+    console.error('  request:', JSON.stringify({
+      model_requested: model,
+      model_sent: zenModel,
+      messages: Array.isArray(messages) ? messages.length : typeof messages,
+      max_tokens: max_tokens,
+      temperature: temperature,
+      stream: !!stream
+    }));
+
+    // Devolve o erro real da Zen pro cliente (JanitorAI/Lorebary)
+    res.status(status).json({
       error: {
-        message: error.message || 'Internal server error',
+        message: upstreamBody ? `${error.message} | Zen: ${upstreamBody}` : (error.message || 'Internal server error'),
         type: 'invalid_request_error',
-        code: error.response?.status || 500
+        code: status
       }
     });
   }
-});
+}
+
+// Registrada com e sem /v1, funciona seja qual for a base URL do cliente
+app.post(['/v1/chat/completions', '/chat/completions'], handleChatCompletions);
 
 // Catch-all for unsupported endpoints
 app.all('*', (req, res) => {
